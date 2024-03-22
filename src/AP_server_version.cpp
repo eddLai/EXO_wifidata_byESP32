@@ -73,7 +73,7 @@ void command() {
                 Serial.print("received data from PC: ");
                 MySerial.print(cmd_str);
                 Serial.println(cmd_str);
-                client.write((const uint8_t *)cmd_str.c_str(), cmd_str.length());
+                // client.write((const uint8_t *)cmd_str.c_str(), cmd_str.length());
                 cmd_str = "";
             }
             }
