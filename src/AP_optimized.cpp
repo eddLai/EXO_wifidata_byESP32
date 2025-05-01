@@ -1,141 +1,235 @@
-#include <Arduino.h>
-#include <WiFi.h>
-#include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
+/**
+ * ESP32 ODC bridge
+ * --------------------------------------------------------------
+ * - TCP 8080  :  收命令 (0x01) → 轉發給 UART2
+ * - UDP 5000  :  把 UART2 每一行 (以 '\n' 結尾) 廣播到子網
+ * - mDNS      :  esp32odc.local
+ * --------------------------------------------------------------
+ * UART2  :  RX = 16, TX = 17, 115 200-8-N-1
+ * Wi-Fi  :  STA mode，IP 固定 10.154.48.200
+ */
 
-// WiFi設定
-const char* ssid = "MyESP32AP";
-const char* password = "12345678";
-WiFiServer server(8080);
-
-// UART設定
-HardwareSerial MySerial(2); // UART2
-const int UART_RX_PIN = 16;
-const int UART_TX_PIN = 17;
-
-// Buffer設定
-const int bufSize = 64; // 增大一點比較安全
-char buf[bufSize];
-String cmd_str;
-WiFiClient client;
-
-// 任務宣告
-void command();
-void getHip_INFO();
-void handleCommandsTask(void* pvParameters);
-void getAndSendHipInfoTask(void* pvParameters);
-
-void setup() {
-  // 關掉 Brownout detector
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-
-  Serial.begin(115200);
-  delay(500); // 保險一點的延遲
-
-  // WiFi AP模式設定
-  IPAddress IP(192, 168, 4, 1);
-  IPAddress gateway(192, 168, 4, 1);
-  IPAddress subnet(255, 255, 255, 0);
-
-  WiFi.mode(WIFI_AP);
-  if (!WiFi.softAPConfig(IP, gateway, subnet)) {
-    Serial.println("AP Config Failed!");
-  }
-  if (!WiFi.softAP(ssid, password, 6)) { // 指定Channel 6，避開1/11常見干擾
-    Serial.println("AP Start Failed!");
-  }
-
-  Serial.print("AP IP address: ");
-  Serial.println(WiFi.softAPIP());
-
-  server.begin();
-
-  // UART2初始化
-  MySerial.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-  Serial.println("UART2 is ready!");
-
-  // FreeRTOS多核心任務
-  xTaskCreatePinnedToCore(handleCommandsTask, "HandleCommands", 4096, NULL, 1, NULL, 0); // 核心0
-  xTaskCreatePinnedToCore(getAndSendHipInfoTask, "GetAndSendHipInfo", 4096, NULL, 1, NULL, 1); // 核心1
-
-  Serial.println("Multi-core setup complete!");
-}
-
-void loop() {
-  if (!client.connected()) {
-    client.stop(); // 確保舊連線清除
-    client = server.available();
-    if (client) {
-      Serial.println("Client connected!");
-    }
-  }
-  vTaskDelay(pdMS_TO_TICKS(500)); // 減少loop負擔
-}
-
-// 處理從client來的指令
-void handleCommandsTask(void* pvParameters) {
-  while (true) {
-    if (client && client.connected()) {
-      command();
-    }
-    vTaskDelay(pdMS_TO_TICKS(10)); // 適度休息
-  }
-}
-
-// 處理從HIP設備來的資料
-void getAndSendHipInfoTask(void* pvParameters) {
-  while (true) {
-    if (client && client.connected()) {
-      getHip_INFO();
-    }
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-}
-
-// 接收並轉送client命令到UART
-void command() {
-  while (client.available()) {
-    char c = client.read();
-    if (c == '\n') { // 當作一條指令結束
-      if (cmd_str.length() > 0) {
-        Serial.print("Received from PC: ");
-        Serial.println(cmd_str);
-
-        MySerial.println(cmd_str); // UART送出去，自帶換行
-        cmd_str = "";
+ #include <Arduino.h>
+ #include <WiFi.h>
+ #include <ESPmDNS.h>
+ #include <WiFiUdp.h>
+ #include "soc/soc.h"
+ #include "soc/rtc_cntl_reg.h"
+ #include "esp_wifi.h"
+ 
+ // ---------------- Wi-Fi & 網路參數 ----------------
+ const char* ssid     = "網路人我的超人";
+ const char* password = "12345666";
+ 
+ IPAddress local_IP (10, 154, 48, 200);
+ IPAddress gateway  (10, 154, 48, 238);   // ipconfig 的「預設閘道」
+ IPAddress subnet   (255, 255, 255, 0);
+ 
+ WiFiServer server(8080);                 // TCP 指令端口
+ WiFiClient client;
+ 
+ WiFiUDP     udp;                         // UDP 廣播
+ const uint16_t UDP_PORT = 5000;
+ IPAddress   bcastIP;
+ 
+ // ---------------- UART2 --------------------------
+ HardwareSerial MySerial(2);
+ const int UART_RX_PIN = 16;
+ const int UART_TX_PIN = 17;
+ 
+ // ---------------- Buffer -------------------------
+ const int   BUF_SIZE = 256;
+ uint8_t     recvBuf[BUF_SIZE];           // TCP→UART 封包暫存
+ int         recvIdx = 0;
+ 
+ char  uartBuf[BUF_SIZE];                 // UART→Wi-Fi 行暫存
+ int   uartIdx = 0;
+ bool  isLEDOn = false;
+ 
+ // ---------------- 任務宣告 ------------------------
+ void handleWiFiTask (void* pv);
+ void handleUARTTask(void* pv);
+ void processPacket ();
+ uint8_t calculateCRC8(const uint8_t* data, int len);
+ void sendResponse  (uint8_t cmdID, const uint8_t* payload, int len);
+ 
+ // =================================================
+ //                         S E T U P
+ // =================================================
+ void setup() {
+   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);   // 關掉 brown-out reset
+   Serial.begin(115200);
+   delay(500);
+ 
+   // ── Wi-Fi STA 固定 IP ──
+   WiFi.mode(WIFI_STA);
+   if (!WiFi.config(local_IP, gateway, subnet))
+     Serial.println("STA Failed to configure");
+ 
+   WiFi.begin(ssid, password);
+   Serial.print("Connecting Wi-Fi");
+   while (WiFi.status() != WL_CONNECTED) { Serial.print('.'); delay(500); }
+   Serial.printf("\nConnected! IP = %s\n", WiFi.localIP().toString().c_str());
+ 
+   // 廣播位址：同網段末尾 .255
+   bcastIP = gateway;
+   bcastIP[3] = 255;
+   udp.begin(UDP_PORT);
+   Serial.printf("UDP broadcast  %s:%u\n", bcastIP.toString().c_str(), UDP_PORT);
+ 
+   // TCP Server
+   server.begin();
+ 
+   // 省電模式
+   WiFi.setSleep(true);
+   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+ 
+   // mDNS
+   if (MDNS.begin("esp32odc"))
+     Serial.println("mDNS responder: esp32odc.local");
+ 
+   // UART2
+   MySerial.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+   Serial.println("UART2 ready");
+   pinMode(LED_BUILTIN, OUTPUT);
+   digitalWrite(LED_BUILTIN, LOW);
+ 
+   // 任務
+   xTaskCreatePinnedToCore(handleWiFiTask , "WiFiTask" , 4096, NULL, 1, NULL, 0);
+   xTaskCreatePinnedToCore(handleUARTTask , "UARTTask" , 4096, NULL, 1, NULL, 1);
+ 
+   Serial.println("Setup complete.");
+ }
+ 
+ // =================================================
+ //                       L O O P
+ // =================================================
+ void loop() { vTaskDelay(pdMS_TO_TICKS(1000)); }   // 主要邏輯都在任務
+ 
+ // =================================================
+ //              Wi-Fi (TCP)  →  UART2
+ // =================================================
+ void handleWiFiTask(void* pv) {
+   for (;;) {
+    if (!client.connected()) {
+      if (client) {
+        Serial.println("TCP client disconnected");
+        digitalWrite(LED_BUILTIN, LOW);  // 關燈
       }
-    } else {
-      if (cmd_str.length() < bufSize - 1) {
-        cmd_str += c;
-      } else {
-        Serial.println("Warning: Command too long, clearing buffer.");
-        cmd_str = "";
+      client.stop();             // 釋放舊 client
+      client = server.available();  // 等待新 client 連線
+      if (client) {
+        Serial.println("TCP client connected");
+        digitalWrite(LED_BUILTIN, HIGH);  // 開燈
       }
-    }
-  }
-}
-
-// 讀取UART資料並回送到client
-void getHip_INFO() {
-  static const int bufferSize = 1024;
-  static char buffer[bufferSize];
-  static int index = 0;
-
-  while (MySerial.available()) {
-    char c = MySerial.read();
-    buffer[index++] = c;
-
-    if (c == '\n' || index >= bufferSize - 1) {
-      buffer[index] = '\0'; // 字串結束
-      Serial.print("From HIP: ");
-      Serial.println(buffer);
-
-      if (client && client.connected()) {
-        client.println(buffer);
-      }
-
-      index = 0; // Reset
-      break;     // 一次處理一行
-    }
-  }
-}
+     }
+ 
+     while (client && client.connected() && client.available()) {
+       if (recvIdx < BUF_SIZE)
+         recvBuf[recvIdx++] = client.read();
+       else
+         recvIdx = 0;                    // overflow reset
+ 
+       processPacket();
+     }
+     vTaskDelay(pdMS_TO_TICKS(10));
+   }
+ }
+ 
+ // =================================================
+ //              UART2  →  Wi-Fi (UDP & TCP 回應)
+ // =================================================
+ void handleUARTTask(void* pv) {
+   for (;;) {
+     while (MySerial.available()) {
+       char c = MySerial.read();
+       uartBuf[uartIdx++] = c;
+ 
+       if (c == '\n' || uartIdx >= BUF_SIZE - 1) {
+         // 結束符號
+         uartBuf[uartIdx] = '\0';
+ 
+         // ① UDP 廣播
+         udp.beginPacket(bcastIP, UDP_PORT);
+         udp.write((uint8_t*)uartBuf, uartIdx);
+         udp.endPacket();
+ 
+         // ② (可選) TCP client 回傳
+         if (client && client.connected())
+           sendResponse(0x02, (uint8_t*)uartBuf, uartIdx);
+ 
+         uartIdx = 0;
+         break;
+       }
+     }
+     vTaskDelay(pdMS_TO_TICKS(10));
+   }
+ }
+ 
+ // =================================================
+ //     Parse TCP 封包，CmdID 0x01 → 發到 UART2
+ // =================================================
+ void processPacket() {
+   while (recvIdx >= 5) {
+     if (recvBuf[0]!=0xAA || recvBuf[1]!=0x55) {
+       memmove(recvBuf, recvBuf+1, --recvIdx);
+       continue;
+     }
+     uint8_t cmdID  = recvBuf[2];
+     uint8_t length = recvBuf[3];
+ 
+     if (recvIdx < 5 + length) break;          // 尚未完整收到
+ 
+     uint8_t crc = recvBuf[4 + length];
+     if (calculateCRC8(recvBuf, 4 + length) != crc) {
+       Serial.println("CRC fail → resync");
+       memmove(recvBuf, recvBuf+1, --recvIdx);
+       continue;
+     }
+ 
+     // ---------- 指令處理 ----------
+     if (cmdID == 0x01) {                      // PC→UART 指令
+       MySerial.write(&recvBuf[4], length);
+       sendResponse(0x03, (const uint8_t*)"ACK", 3);   // 即時 ACK
+       
+     }
+     else if (cmdID == 0x03) {
+       sendResponse(0x03, (const uint8_t*)"ACK", 3);
+     }
+     // --------------------------------
+     else if (cmdID == 0x10) {  // 反轉 LED 狀態
+      isLEDOn = !isLEDOn;                              // 狀態反轉
+      digitalWrite(LED_BUILTIN, isLEDOn ? HIGH : LOW); // Toggle LED based on current state
+      Serial.printf("💡 Command received: LED turned %s\n", isLEDOn ? "ON" : "OFF");
+      sendResponse(0x10, (const uint8_t*)"OK", 2);      // Send ACK response
+     }    
+ 
+     int consumed = 5 + length;
+     memmove(recvBuf, recvBuf + consumed, recvIdx - consumed);
+     recvIdx -= consumed;
+   }
+ }
+ 
+ // =================================================
+ //                      工具函式
+ // =================================================
+ uint8_t calculateCRC8(const uint8_t* data, int len) {
+   uint8_t crc = 0;
+   for (int i = 0; i < len; i++) crc ^= data[i];
+   return crc;
+ }
+ 
+ void sendResponse(uint8_t cmdID, const uint8_t* payload, int len) {
+   uint8_t pkt[BUF_SIZE];
+   int idx = 0;
+   pkt[idx++] = 0xAA; pkt[idx++] = 0x55;
+   pkt[idx++] = cmdID;
+   pkt[idx++] = len;
+   memcpy(pkt + idx, payload, len);
+   idx += len;
+   pkt[idx++] = calculateCRC8(pkt, idx);
+ 
+   if (client && client.connected())
+     client.write(pkt, idx);
+ }
+ 
