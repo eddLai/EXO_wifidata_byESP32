@@ -8,6 +8,6 @@ void setup() {
 }
 
 void loop() {
-  MySerial.println("Hello from ESP32 UART2!");
+  MySerial.println("X E 0 E 0\r\n");
   delay(1000);  // 每秒發一次
 }
